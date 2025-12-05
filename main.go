@@ -76,7 +76,7 @@ func getMACByIP(targetIP net.IP) (net.HardwareAddr, error) {
 
 // --- Pembuat Paket ---
 
-// createDiscoverPacket membuat paket DHCPDISCOVER
+// createDiscoverPacket membuat paket DHCPDISCOVER secara manual
 func createDiscoverPacket(clientMAC net.HardwareAddr, xid uint32) ([]byte, error) {
 	ethLayer := &layers.Ethernet{
 		SrcMAC:       clientMAC,
@@ -91,29 +91,36 @@ func createDiscoverPacket(clientMAC net.HardwareAddr, xid uint32) ([]byte, error
 	udpLayer := &layers.UDP{SrcPort: 68, DstPort: 67}
 	udpLayer.SetNetworkLayerForChecksum(ipLayer)
 
-	dhcpOptions := []layers.DHCPOption{
-		{Type: layers.DHCPOptMessageType, Data: []byte{byte(layers.DHCPMsgTypeDiscover)}},
-		{Type: 55, Data: []byte{1, 3, 6, 15, 119}}, // Parameter Request List
-		{Type: layers.DHCPOptEnd},
-	}
-	dhcpLayer := &layers.DHCPv4{
-		Operation:    layers.DHCPOpRequest,
-		HardwareType: layers.LinkTypeEthernet,
-		ClientHWAddr: clientMAC,
-		Xid:          xid,
-		Flags:        0x8000,
-		Options:      dhcpOptions,
-	}
+	// --- Bangun payload DHCP secara manual ---
+	payload := make([]byte, 240) // Header DHCP 240 byte
 
+	// Header
+	payload[0] = 1                                           // Op: Request
+	payload[1] = 1                                           // Htype: Ethernet
+	payload[2] = 6                                           // Hlen: 6
+	binary.BigEndian.PutUint32(payload[4:8], xid)            // Xid
+	binary.BigEndian.PutUint16(payload[10:12], 0x8000)       // Flags: Broadcast
+	copy(payload[28:34], clientMAC)                          // Client MAC
+	binary.BigEndian.PutUint32(payload[236:240], 0x63825363) // Magic Cookie
+
+	// Opsi
+	options := []byte{
+		53, 1, 1, // Message Type: DISCOVER
+		55, 3, 1, 3, 6, // Parameter Request List
+		255, // End
+	}
+	payloadWithOpts := append(payload, options...)
+
+	// --- Kirim Paket ---
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if err := gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, dhcpLayer); err != nil {
+	if err := gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, gopacket.Payload(payloadWithOpts)); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
-// createRequestPacket membuat paket DHCPREQUEST
+// createRequestPacket membuat paket DHCPREQUEST secara manual
 func createRequestPacket(clientMAC net.HardwareAddr, xid uint32, offeredIP, serverIP net.IP) ([]byte, error) {
 	ethLayer := &layers.Ethernet{
 		SrcMAC:       clientMAC,
@@ -128,26 +135,35 @@ func createRequestPacket(clientMAC net.HardwareAddr, xid uint32, offeredIP, serv
 	udpLayer := &layers.UDP{SrcPort: 68, DstPort: 67}
 	udpLayer.SetNetworkLayerForChecksum(ipLayer)
 
-	// Opsi untuk REQUEST berbeda dengan DISCOVER
-	dhcpOptions := []layers.DHCPOption{
-		{Type: layers.DHCPOptMessageType, Data: []byte{byte(layers.DHCPMsgTypeRequest)}},
-		{Type: layers.DHCPOptRequestIP, Data: offeredIP.To4()}, // Meminta IP yang ditawarkan
-		{Type: layers.DHCPOptServerID, Data: serverIP.To4()},   // Menyebut server mana yang dipilih
-		{Type: layers.DHCPOptEnd},
-	}
-	dhcpLayer := &layers.DHCPv4{
-		Operation:    layers.DHCPOpRequest,
-		HardwareType: layers.LinkTypeEthernet,
-		ClientHWAddr: clientMAC,
-		Xid:          xid,
-		Flags:        0x8000,
-		ClientIP:     offeredIP, // Field ini diisi dengan IP yang diminta
-		Options:      dhcpOptions,
-	}
+	// --- Bangun payload DHCP secara manual ---
+	payload := make([]byte, 240) // Header DHCP 240 byte
 
+	// Header
+	payload[0] = 1                                           // Op: Request
+	payload[1] = 1                                           // Htype: Ethernet
+	payload[2] = 6                                           // Hlen: 6
+	binary.BigEndian.PutUint32(payload[4:8], xid)            // Xid
+	binary.BigEndian.PutUint16(payload[10:12], 0x8000)       // Flags: Broadcast
+	copy(payload[12:16], offeredIP.To4())                    // Client IP: IP yang diminta
+	copy(payload[28:34], clientMAC)                          // Client MAC
+	binary.BigEndian.PutUint32(payload[236:240], 0x63825363) // Magic Cookie
+
+	// Opsi
+	options := []byte{
+		53, 1, 3, // Message Type: REQUEST
+		50, 4, // Requested IP
+	}
+	options = append(options, offeredIP.To4()...) // Data untuk Requested IP
+	options = append(options, []byte{54, 4}...)   // Server Identifier
+	options = append(options, serverIP.To4()...)  // Data untuk Server Identifier
+	options = append(options, 255)                // End
+
+	payloadWithOpts := append(payload, options...)
+
+	// --- Kirim Paket ---
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if err := gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, dhcpLayer); err != nil {
+	if err := gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, udpLayer, gopacket.Payload(payloadWithOpts)); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
